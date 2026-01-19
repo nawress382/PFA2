@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+# core dependencies (also in the repo requirements)
+opencv-python
+numpy
+scikit-learn
+dlib
+PyQt6
