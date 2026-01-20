@@ -1008,8 +1008,6 @@ class AuthenticationWorker(QThread):
 
                                 landmarks = predictor(frame2, face_rect_original)
                                 yaw, pitch, roll, rvec, tvec = estimate_pose(landmarks, frame2.shape[1], frame2.shape[0])
-                                # dessiner le maillage 3D projeté si on a rvec/tvec
-                                draw_3d_mesh(display2, rvec, tvec, landmarks=landmarks)
 
                                 target = user_poses.get(required_pose)
                                 if target is None:
