@@ -205,7 +205,7 @@ def capture_images_headless(user_name, num_images_per_pose=40, output_dir="datas
     return {'user': user_name, 'total_captured': captured_count}
 
 
-def authenticate_sequence(known_encodings, known_names, known_poses, camera_index=0, total_challenges=5, challenge_timeout=12, progress_callback=None, status_callback=None, frame_callback=None, debug_poses=False):
+def authenticate_sequence(known_encodings, known_names, known_poses, camera_index=0, total_challenges=2, challenge_timeout=12, progress_callback=None, status_callback=None, frame_callback=None, debug_poses=False):
     """Run the authentication flow headless and report events via callbacks.
     Callbacks:
       - status_callback(text:str)

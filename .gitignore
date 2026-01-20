@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+
+# Dataset & generated data
+dataset/
+*.pkl
+processed_face_data.json
