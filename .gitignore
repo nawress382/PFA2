@@ -9,3 +9,8 @@ venv/
 dataset/
 *.pkl
 processed_face_data.json
+
+# Frontend
+node_modules/
+dist/
+.env
