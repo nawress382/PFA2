@@ -6,9 +6,10 @@ import math
 import time
 from sklearn.neighbors import NearestNeighbors
 import sys
-from PyQt6.QtWidgets import QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QInputDialog, QProgressBar, QGraphicsDropShadowEffect
-from PyQt6.QtGui import QPixmap, QImage
+from PyQt6.QtWidgets import QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QInputDialog, QProgressBar, QGraphicsDropShadowEffect, QDialog, QFrame
+from PyQt6.QtGui import QPixmap, QImage, QColor
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal, QThread
+
 
 # Import the headless service functions for business logic (API-friendly)
 from face_service import (
@@ -49,7 +50,332 @@ class DatasetLoaderThread(QThread):
         finally:
             self.finished.emit()
 
+class CaptureThread(QThread):
+    """Background thread for video capture with face detection and pose estimation."""
+    frame_ready = pyqtSignal(QImage)
+    image_captured = pyqtSignal(str, str)  # pose, image_path
+    status_update = pyqtSignal(str)
+    progress_update = pyqtSignal(int)
+    
+    def __init__(self, user_name, poses_list, num_per_pose=40, parent=None):
+        super().__init__(parent)
+        self.user_name = user_name
+        self.poses_list = poses_list
+        self.num_per_pose = num_per_pose
+        self._running = True
+        self.current_pose_index = 0
+        self.captured_count = 0
+        self.total_to_capture = len(poses_list) * num_per_pose
+    
+    def run(self):
+        """Main capture loop."""
+        user_output_dir = os.path.join("dataset", self.user_name)
+        os.makedirs(user_output_dir, exist_ok=True)
+        
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            self.status_update.emit("Erreur : Impossible d'ouvrir la caméra")
+            return
+        
+        try:
+            for pose_idx, pose in enumerate(self.poses_list):
+                if not self._running:
+                    break
+                
+                self.current_pose_index = pose_idx
+                self.status_update.emit(f"Préparation pour la pose : {pose}")
+                
+                # Attendre avant de commencer la capture
+                for i in range(WAIT_BETWEEN_POSES):
+                    if not self._running:
+                        break
+                    self.status_update.emit(f"Pose '{pose}' commence dans {WAIT_BETWEEN_POSES - i}s...")
+                    time.sleep(1)
+                
+                current_pose_count = 0
+                last_save_time = 0
+                last_centers = []
+                
+                while current_pose_count < self.num_per_pose and self._running:
+                    ret, frame = cap.read()
+                    if not ret:
+                        self.status_update.emit("Erreur : Impossible de lire la caméra")
+                        break
+                    
+                    display_frame = frame.copy()
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    faces = detector(gray)
+                    
+                    if len(faces) == 1:
+                        face_rect = faces[0]
+                        x, y, w, h = face_rect.left(), face_rect.top(), face_rect.width(), face_rect.height()
+                        
+                        # Draw rectangle
+                        cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                        
+                        # Check stability
+                        cx = x + w / 2
+                        cy = y + h / 2
+                        last_centers.append((cx, cy))
+                        
+                        if len(last_centers) > STABLE_FRAMES_REQUIRED:
+                            last_centers.pop(0)
+                        
+                        stable = False
+                        if len(last_centers) == STABLE_FRAMES_REQUIRED:
+                            max_dist = 0
+                            for i in range(len(last_centers)):
+                                for j in range(i+1, len(last_centers)):
+                                    dx = last_centers[i][0] - last_centers[j][0]
+                                    dy = last_centers[i][1] - last_centers[j][1]
+                                    dist = math.hypot(dx, dy)
+                                    if dist > max_dist:
+                                        max_dist = dist
+                            if max_dist <= STABILITY_THRESH:
+                                stable = True
+                        
+                        # Auto-capture if stable
+                        now = time.time()
+                        if stable and (now - last_save_time >= MIN_TIME_BETWEEN_SAVES):
+                            img_path = os.path.join(user_output_dir, f"{self.user_name}_{pose}_{current_pose_count:03d}.jpg")
+                            cv2.imwrite(img_path, frame)
+                            current_pose_count += 1
+                            self.captured_count += 1
+                            last_save_time = now
+                            self.image_captured.emit(pose, img_path)
+                            self.progress_update.emit(int((self.captured_count / self.total_to_capture) * 100))
+                        
+                        # Update status
+                        status_txt = f"Pose {pose}: {current_pose_count}/{self.num_per_pose} (Stabilité: {'✓' if stable else '✗'})"
+                        self.status_update.emit(status_txt)
+                    else:
+                        last_centers = []
+                        self.status_update.emit("Placez votre visage au centre")
+                    
+                    # Convert frame to QImage for display
+                    rgb_display = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                    h_frame, w_frame, ch = rgb_display.shape
+                    bytes_per_line = ch * w_frame
+                    qt_img = QImage(rgb_display.data, w_frame, h_frame, bytes_per_line, QImage.Format.Format_RGB888)
+                    self.frame_ready.emit(qt_img)
+                    
+                    time.sleep(0.03)  # ~33 FPS
+                
+                # Pause between poses
+                if pose_idx < len(self.poses_list) - 1:
+                    self.status_update.emit(f"Pose '{pose}' terminée. Pause de 3s...")
+                    time.sleep(3)
+        
+        finally:
+            cap.release()
+            if self._running:
+                self.status_update.emit(f"Capture terminée : {self.captured_count} images sauvegardées")
+            else:
+                self.status_update.emit("Capture annulée par l'utilisateur")
+    
+    def stop(self):
+        """Stop the capture thread."""
+        self._running = False
+        self.wait()
 
+class CaptureDialog(QDialog):
+    def __init__(self, user_name, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Enregistrement : {user_name}")
+        self.setFixedSize(650, 750)
+        
+        # Style général (Dark Theme & Neon Blue)
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #0f1222;
+                border: 2px solid #1e293b;
+            }
+            QLabel {
+                color: #e6eef8;
+                font-family: 'Segoe UI', Arial;
+            }
+            #titleLabel {
+                font-size: 22px;
+                font-weight: bold;
+                color: #7bdcff;
+                margin-bottom: 5px;
+            }
+            #instructionLabel {
+                font-size: 16px;
+                color: #bcd3ff;
+                background-color: rgba(58, 122, 254, 0.1);
+                padding: 10px;
+                border-radius: 8px;
+                border: 1px solid rgba(58, 122, 254, 0.3);
+            }
+            QProgressBar {
+                background-color: #141826;
+                border: 1px solid #1e293b;
+                border-radius: 10px;
+                text-align: center;
+                height: 20px;
+                color: transparent;
+            }
+            QProgressBar::chunk {
+                background-color: qlineargradient(spread:pad, x1:0, y1:0, x2:1, y2:0, 
+                                    stop:0 #3a7afe, stop:1 #7bdcff);
+                border-radius: 10px;
+            }
+            .PoseChip {
+                background-color: #161b33;
+                border: 1px solid #1e293b;
+                border-radius: 12px;
+                padding: 8px;
+                color: #64748b;
+                font-weight: bold;
+                font-size: 11px;
+            }
+            .PoseChip[active="true"] {
+                border: 1px solid #3a7afe;
+                color: #3a7afe;
+                background-color: rgba(58, 122, 254, 0.1);
+            }
+            .PoseChip[done="true"] {
+                border: 1px solid #10b981;
+                color: #10b981;
+                background-color: rgba(16, 185, 129, 0.1);
+            }
+        """)
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(30, 30, 30, 30)
+        layout.setSpacing(20)
+
+        # En-tête
+        header_layout = QVBoxLayout()
+        self.title_label = QLabel(f"Profil : {user_name}")
+        self.title_label.setObjectName("titleLabel")
+        header_layout.addWidget(self.title_label)
+        
+        self.instruction_label = QLabel("Initialisation de la caméra...")
+        self.instruction_label.setObjectName("instructionLabel")
+        self.instruction_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        header_layout.addWidget(self.instruction_label)
+        layout.addLayout(header_layout)
+
+        # Zone Vidéo avec effet de lueur
+        self.video_container = QFrame()
+        self.video_container.setFixedSize(480, 480)
+        self.video_container.setStyleSheet("""
+            QFrame {
+                border: 3px solid #1e293b;
+                border-radius: 240px; /* Cercle parfait */
+                background-color: #000000;
+            }
+        """)
+        
+        # Ajout d'une ombre portée bleue pour l'effet "Néon"
+        glow = QGraphicsDropShadowEffect()
+        glow.setBlurRadius(25)
+        glow.setColor(QColor(58, 122, 254, 150))
+        glow.setOffset(0, 0)
+        self.video_container.setGraphicsEffect(glow)
+
+        self.video_label = QLabel(self.video_container)
+        self.video_label.setFixedSize(480, 480)
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label.setStyleSheet("border-radius: 240px;") # Important pour clipper l'image
+
+        video_layout = QHBoxLayout()
+        video_layout.addWidget(self.video_container)
+        layout.addLayout(video_layout)
+
+        # Indicateurs de Poses (Chips)
+        self.poses_layout = QHBoxLayout()
+        self.pose_chips = {}
+        for p in ["Face", "Gauche", "Droite", "Haut", "Bas"]:
+            chip = QLabel(p.upper())
+            chip.setProperty("active", "false")
+            chip.setProperty("done", "false")
+            chip.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            chip.setFixedWidth(90)
+            chip.setObjectName(f"chip_{p.lower()}")
+            chip.setProperty("class", "PoseChip")
+            self.pose_chips[p.lower()] = chip
+            self.poses_layout.addWidget(chip)
+        layout.addLayout(self.poses_layout)
+
+        # Barre de progression et Statut
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        layout.addWidget(self.progress_bar)
+
+        self.status_label = QLabel("Veuillez vous placer face à l'objectif")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_label.setStyleSheet("color: #64748b; font-size: 13px;")
+        layout.addWidget(self.status_label)
+
+        # Boutons de contrôle
+        button_layout = QHBoxLayout()
+        self.ok_button = QPushButton("Terminer")
+        self.ok_button.setStyleSheet("""
+            QPushButton {
+                background-color: #10b981;
+                color: white;
+                font-weight: bold;
+                padding: 8px 20px;
+                border-radius: 6px;
+            }
+            QPushButton:hover { background-color: #059669; }
+        """)
+        self.cancel_button = QPushButton("Annuler")
+        self.cancel_button.setStyleSheet("""
+            QPushButton {
+                background-color: #ef4444;
+                color: white;
+                font-weight: bold;
+                padding: 8px 20px;
+                border-radius: 6px;
+            }
+            QPushButton:hover { background-color: #dc2626; }
+        """)
+        
+        self.ok_button.clicked.connect(self.accept)
+        self.cancel_button.clicked.connect(self.reject)
+        
+        button_layout.addStretch()
+        button_layout.addWidget(self.ok_button)
+        button_layout.addWidget(self.cancel_button)
+        button_layout.addStretch()
+        layout.addLayout(button_layout)
+
+        self.setLayout(layout)
+
+    def update_pose_status(self, current_pose):
+        """Met à jour l'apparence des indicateurs de pose."""
+        pose_map = {
+            "frontale": "face", "gauche": "gauche", "droite": "droite", 
+            "haut": "haut", "bas": "bas"
+        }
+        current_pose = pose_map.get(current_pose, "")
+
+        for p_name, chip in self.pose_chips.items():
+            if p_name == current_pose:
+                chip.setProperty("active", "true")
+                chip.setProperty("done", "false")
+                self.instruction_label.setText(f"Action requise : Regardez vers {p_name.upper()}")
+            elif chip.property("active") == "true": # Marquer comme fini si c'était l'ancien actif
+                chip.setProperty("active", "false")
+                chip.setProperty("done", "true")
+            
+            # Forcer le rafraîchissement du style CSS
+            chip.style().unpolish(chip)
+            chip.style().polish(chip)
+
+    def set_frame(self, image):
+        """Affiche l'image de la caméra dans le cercle."""
+        # On crop l'image en carré pour le cercle si nécessaire
+        pixmap = QPixmap.fromImage(image)
+        self.video_label.setPixmap(pixmap.scaled(
+            self.video_label.size(), 
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding, 
+            Qt.TransformationMode.SmoothTransformation
+        ))
 class FaceAuthApp(QWidget):
     def __init__(self):
         super().__init__()
@@ -543,111 +869,34 @@ def draw_3d_mesh(frame, rvec, tvec, landmarks=None, color=(110, 160, 255), lat_s
 # --- Fonctions de capture d'images ---
 
 def capture_images(user_name, num_images_per_pose=40, output_dir="dataset"):
-    user_output_dir = os.path.join(output_dir, user_name)
-    os.makedirs(user_output_dir, exist_ok=True)
-
-    cap = cv2.VideoCapture(0)
-
-    if not cap.isOpened():
-        print("Erreur : Impossible d'ouvrir la caméra pour la capture d'images.")
-        return
-
-    print(f"Préparation à la capture pour {user_name}. Appuyez sur 'q' pour quitter.")
-    print("Veuillez regarder de face, puis tourner légèrement la tête à gauche, à droite, en haut, en bas pour chaque série.")
+    """Open a PyQt6 dialog for image capture with video preview."""
+    dialog = CaptureDialog(user_name)
     
-    captured_count = 0
     poses = ["frontale", "gauche", "droite", "haut", "bas"]
-    images_to_capture_total = num_images_per_pose * len(poses)
     
-    print(f"Total d'images à capturer : {images_to_capture_total}")
-
-    for pose_index, pose in enumerate(poses):
-        print(f"\nPréparez-vous pour la pose : {pose}. Capture de {num_images_per_pose} images.")
-        print(f"Attente {WAIT_BETWEEN_POSES} secondes avant le début de la capture pour cette pose...")
-        time.sleep(WAIT_BETWEEN_POSES)
-
-        current_pose_count = 0
-        # Pour la capture automatique, on garde le temps de la dernière sauvegaFrde
-        last_save_time = 0
-        # stockage des derniers centres pour vérifier la stabilité
-        last_centers = []
-        while current_pose_count < num_images_per_pose:
-            ret, frame = cap.read()
-
-            if not ret:
-                print("Erreur : Impossible de lire l'image de la caméra.")
-                break
-
-            display_frame = frame.copy()
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = detector(gray)
-
-            if len(faces) == 1:
-                face_rect = faces[0]
-                x, y, w, h = face_rect.left(), face_rect.top(), face_rect.width(), face_rect.height()
-                cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
-                cv2.putText(display_frame, f"Pose {pose}: {current_pose_count+1}/{num_images_per_pose}", 
-                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                cv2.putText(display_frame, "Capture automatique active... (stabilité requise)", 
-                            (10, frame.shape[0] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 1)
-
-                # Vérifier la stabilité : utiliser le centre du rectangle
-                cx = x + w / 2
-                cy = y + h / 2
-                last_centers.append((cx, cy))
-                # ne garder que les derniers STABLE_FRAMES_REQUIRED centres
-                if len(last_centers) > STABLE_FRAMES_REQUIRED:
-                    last_centers.pop(0)
-
-                stable = False
-                if len(last_centers) == STABLE_FRAMES_REQUIRED:
-                    # calculer la distance max entre centres
-                    max_dist = 0
-                    for i in range(len(last_centers)):
-                        for j in range(i+1, len(last_centers)):
-                            dx = last_centers[i][0] - last_centers[j][0]
-                            dy = last_centers[i][1] - last_centers[j][1]
-                            dist = math.hypot(dx, dy)
-                            if dist > max_dist:
-                                max_dist = dist
-                    if max_dist <= STABILITY_THRESH:
-                        stable = True
-
-                # Sauvegarde automatique si stable et assez de temps est passé depuis la dernière capture
-                now = time.time()
-                if stable and (now - last_save_time >= MIN_TIME_BETWEEN_SAVES) and current_pose_count < num_images_per_pose:
-                    img_path = os.path.join(user_output_dir, f"{user_name}_{pose}_{current_pose_count:03d}.jpg")
-                    cv2.imwrite(img_path, frame)
-                    print(f"Image sauvegardée automatiquement (stable) : {img_path}")
-                    current_pose_count += 1
-                    captured_count += 1
-                    last_save_time = now
-
-            else:
-                # reset stability tracking si visage perdu
-                last_centers = []
-                cv2.putText(display_frame, "Placez votre visage au centre", 
-                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-            
-            cv2.imshow('Capture Images', display_frame)
-            
-            key = cv2.waitKey(1) & 0xFF
-            # L'utilisateur peut toujours appuyer sur 'q' pour annuler la capture
-            if key == ord('q'):
-                print("Capture annulée.")
-                cap.release()
-                cv2.destroyAllWindows()
-                return
-
-        if current_pose_count == num_images_per_pose:
-            print(f"Capture de la pose '{pose}' terminée.")
-            print("Pause 5 secondes avant la pose suivante...")
-            time.sleep(5)
-
-    cap.release()
-    cv2.destroyAllWindows()
-    print(f"\nCapture d'images pour {user_name} terminée. Total : {captured_count} images.")
+    # Create and start the capture thread
+    capture_thread = CaptureThread(user_name, poses, num_images_per_pose, parent=dialog)
+    
+    # Connect signals from thread to dialog
+    capture_thread.frame_ready.connect(dialog.set_frame)
+    capture_thread.status_update.connect(lambda txt: dialog.status_label.setText(txt))
+    capture_thread.progress_update.connect(lambda val: dialog.progress_bar.setValue(val))
+    capture_thread.image_captured.connect(lambda pose, path: dialog.update_pose_status(pose))
+    
+    # Start capture
+    capture_thread.start()
+    
+    # Show dialog and wait for completion
+    result = dialog.exec()
+    
+    # Stop thread if still running
+    if capture_thread.isRunning():
+        capture_thread.stop()
+    
+    if result == QDialog.DialogCode.Accepted:
+        print(f"Capture d'images pour {user_name} terminée avec succès.")
+    else:
+        print("Capture annulée par l'utilisateur.")
 
 # --- Fonctions de chargement du dataset ---
 
