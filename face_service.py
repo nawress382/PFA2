@@ -4,12 +4,15 @@ import numpy as np
 import os
 import math
 import time
+import pickle
+import hashlib
 from sklearn.neighbors import NearestNeighbors
 
 # Constants expected by the rest of the codebase. You can customize or import from main module.
 SHAPE_PREDICTOR_PATH = "shape_predictor_68_face_landmarks.dat"
 FACE_RECOGNITION_MODEL_PATH = "dlib_face_recognition_resnet_model_v1.dat"
 DIST_COEFFS = np.zeros((4, 1))
+CACHE_FILE = "face_encodings_cache.pkl"
 
 # load dlib models lazily
 _detector = dlib.get_frontal_face_detector()
@@ -27,6 +30,28 @@ def _ensure_models():
         if not os.path.exists(FACE_RECOGNITION_MODEL_PATH):
             raise FileNotFoundError(f"face recognition model not found at {FACE_RECOGNITION_MODEL_PATH}")
         _face_recognizer = dlib.face_recognition_model_v1(FACE_RECOGNITION_MODEL_PATH)
+
+
+def _get_dataset_hash(dataset_dir="dataset"):
+    """Generate a hash representing the current state of the dataset."""
+    hasher = hashlib.md5()
+    if not os.path.exists(dataset_dir):
+        return None
+
+    for root, _, files in os.walk(dataset_dir):
+        for f in sorted(files):
+            if f.lower().endswith(('.jpg', '.png')):
+                path = os.path.join(root, f)
+                hasher.update(path.encode())
+                hasher.update(str(os.path.getmtime(path)).encode())
+
+    return hasher.hexdigest()
+
+
+def _clear_cache():
+    """Delete the cache file if it exists."""
+    if os.path.exists(CACHE_FILE):
+        os.remove(CACHE_FILE)
 
 
 def estimate_pose(landmarks, img_w, img_h, camera_matrix=None):
@@ -84,7 +109,21 @@ def get_face_encoding(image_rgb, face_rect):
     return np.array(_face_recognizer.compute_face_descriptor(image_rgb, landmarks))
 
 
-def load_dataset_encodings(dataset_dir="dataset"):
+def load_dataset_encodings(dataset_dir="dataset", use_cache=True):
+    """Load face encodings from dataset, with optional caching."""
+    dataset_hash = _get_dataset_hash(dataset_dir)
+
+    # Try to load from cache if enabled
+    if use_cache and os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "rb") as f:
+                cache = pickle.load(f)
+            if cache.get("hash") == dataset_hash:
+                return cache["encodings"], cache["names"], cache["poses"]
+        except Exception:
+            pass  # Cache corrupted, will recalculate
+
+    # Original logic - compute encodings
     known_encodings = []
     known_names = []
     known_poses = {}
@@ -137,7 +176,22 @@ def load_dataset_encodings(dataset_dir="dataset"):
                 if lst:
                     avg_poses_for_user[pose_key] = np.mean(lst, axis=0)
             known_poses[user_name] = avg_poses_for_user
-    return np.array(known_encodings), known_names, known_poses
+
+    enc_arr = np.array(known_encodings)
+
+    # Save to cache
+    try:
+        with open(CACHE_FILE, "wb") as f:
+            pickle.dump({
+                "hash": dataset_hash,
+                "encodings": enc_arr,
+                "names": known_names,
+                "poses": known_poses
+            }, f)
+    except Exception:
+        pass  # Cache save failed, but continue anyway
+
+    return enc_arr, known_names, known_poses
 
 
 def capture_images_headless(user_name, num_images_per_pose=40, output_dir="dataset", camera_index=0, progress_callback=None):
@@ -205,7 +259,7 @@ def capture_images_headless(user_name, num_images_per_pose=40, output_dir="datas
     return {'user': user_name, 'total_captured': captured_count}
 
 
-def authenticate_sequence(known_encodings, known_names, known_poses, camera_index=0, total_challenges=2, challenge_timeout=12, progress_callback=None, status_callback=None, frame_callback=None, debug_poses=False):
+def authenticate_sequence(known_encodings, known_names, known_poses, camera_index=0, total_challenges=5, challenge_timeout=12, progress_callback=None, status_callback=None, frame_callback=None, debug_poses=False):
     """Run the authentication flow headless and report events via callbacks.
     Callbacks:
       - status_callback(text:str)
