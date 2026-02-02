@@ -148,7 +148,7 @@ def load_dataset_encodings(dataset_dir="dataset", use_cache=True):
                 continue
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
             gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            faces = _detector(gray, 1)
+            faces = _detector(gray, 0)
             if len(faces) != 1:
                 continue
             face = faces[0]
