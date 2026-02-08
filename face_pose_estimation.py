@@ -9,7 +9,9 @@ import sys
 from PyQt6.QtWidgets import QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QInputDialog, QProgressBar, QGraphicsDropShadowEffect, QDialog, QFrame
 from PyQt6.QtGui import QPixmap, QImage, QColor
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal, QThread
-
+import boto3
+from security_utils import encrypt_aes_512, upload_to_s3
+import uuid  # <--- CELUI QUI MANQUAIT
 
 # Import the headless service functions for business logic (API-friendly)
 from face_service import (
@@ -19,7 +21,9 @@ from face_service import (
     capture_images_headless as service_capture_images_headless,
     authenticate_sequence as service_authenticate_sequence,
 )
-
+dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+table = dynamodb.Table('FaceAuthTasks')
+MON_BUCKET = "pfe-face-auth-storage-votre-nom" # Mets ton vrai nom de bucket S3
 
 class DatasetLoaderThread(QThread):
     """Background thread to load dataset without blocking UI."""
@@ -51,7 +55,9 @@ class DatasetLoaderThread(QThread):
             self.finished.emit()
 
 class CaptureThread(QThread):
-    """Background thread for video capture with face detection and pose estimation."""
+
+    """Fil d'exécution pour la capture vidéo avec synchronisation Cloud DynamoDB."""
+    
     frame_ready = pyqtSignal(QImage)
     image_captured = pyqtSignal(str, str)  # pose, image_path
     status_update = pyqtSignal(str)
@@ -66,9 +72,28 @@ class CaptureThread(QThread):
         self.current_pose_index = 0
         self.captured_count = 0
         self.total_to_capture = len(poses_list) * num_per_pose
-    
+        
+        # --- CONFIGURATION CLOUD ---
+        self.task_id = f"CAP-{user_name}-{int(time.time())}"
+        try:
+            self.dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+            self.table = self.dynamodb.Table('FaceAuthTasks')
+        except Exception as e:
+            print(f"Erreur initialisation AWS: {e}")
+
     def run(self):
-        """Main capture loop."""
+        """Boucle principale de capture avec mises à jour Cloud."""
+        # 1. Signaler le DEBUT de la capture sur AWS
+        try:
+            self.table.put_item(Item={
+                'task_id': self.task_id,
+                'status': 'capture_starting',
+                'user': self.user_name,
+                'progress': 0,
+                'timestamp': str(time.time())
+            })
+        except: pass
+
         user_output_dir = os.path.join("dataset", self.user_name)
         os.makedirs(user_output_dir, exist_ok=True)
         
@@ -85,10 +110,19 @@ class CaptureThread(QThread):
                 self.current_pose_index = pose_idx
                 self.status_update.emit(f"Préparation pour la pose : {pose}")
                 
+                # --- UPDATE CLOUD : Changement de pose ---
+                try:
+                    self.table.update_item(
+                        Key={'task_id': self.task_id},
+                        UpdateExpression="set #s = :val",
+                        ExpressionAttributeNames={'#s': 'status'},
+                        ExpressionAttributeValues={':val': f'capturing_pose_{pose}'}
+                    )
+                except: pass
+
                 # Attendre avant de commencer la capture
                 for i in range(WAIT_BETWEEN_POSES):
-                    if not self._running:
-                        break
+                    if not self._running: break
                     self.status_update.emit(f"Pose '{pose}' commence dans {WAIT_BETWEEN_POSES - i}s...")
                     time.sleep(1)
                 
@@ -98,9 +132,7 @@ class CaptureThread(QThread):
                 
                 while current_pose_count < self.num_per_pose and self._running:
                     ret, frame = cap.read()
-                    if not ret:
-                        self.status_update.emit("Erreur : Impossible de lire la caméra")
-                        break
+                    if not ret: break
                     
                     display_frame = frame.copy()
                     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -109,32 +141,23 @@ class CaptureThread(QThread):
                     if len(faces) == 1:
                         face_rect = faces[0]
                         x, y, w, h = face_rect.left(), face_rect.top(), face_rect.width(), face_rect.height()
-                        
-                        # Draw rectangle
                         cv2.rectangle(display_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                         
                         # Check stability
-                        cx = x + w / 2
-                        cy = y + h / 2
+                        cx, cy = x + w / 2, y + h / 2
                         last_centers.append((cx, cy))
-                        
-                        if len(last_centers) > STABLE_FRAMES_REQUIRED:
-                            last_centers.pop(0)
+                        if len(last_centers) > STABLE_FRAMES_REQUIRED: last_centers.pop(0)
                         
                         stable = False
                         if len(last_centers) == STABLE_FRAMES_REQUIRED:
                             max_dist = 0
                             for i in range(len(last_centers)):
                                 for j in range(i+1, len(last_centers)):
-                                    dx = last_centers[i][0] - last_centers[j][0]
-                                    dy = last_centers[i][1] - last_centers[j][1]
-                                    dist = math.hypot(dx, dy)
-                                    if dist > max_dist:
-                                        max_dist = dist
-                            if max_dist <= STABILITY_THRESH:
-                                stable = True
+                                    dist = math.hypot(last_centers[i][0]-last_centers[j][0], last_centers[i][1]-last_centers[j][1])
+                                    if dist > max_dist: max_dist = dist
+                            if max_dist <= STABILITY_THRESH: stable = True
                         
-                        # Auto-capture if stable
+                        # Auto-capture
                         now = time.time()
                         if stable and (now - last_save_time >= MIN_TIME_BETWEEN_SAVES):
                             img_path = os.path.join(user_output_dir, f"{self.user_name}_{pose}_{current_pose_count:03d}.jpg")
@@ -143,38 +166,40 @@ class CaptureThread(QThread):
                             self.captured_count += 1
                             last_save_time = now
                             self.image_captured.emit(pose, img_path)
-                            self.progress_update.emit(int((self.captured_count / self.total_to_capture) * 100))
+                            
+                            prog = int((self.captured_count / self.total_to_capture) * 100)
+                            self.progress_update.emit(prog)
                         
-                        # Update status
-                        status_txt = f"Pose {pose}: {current_pose_count}/{self.num_per_pose} (Stabilité: {'✓' if stable else '✗'})"
-                        self.status_update.emit(status_txt)
+                        self.status_update.emit(f"Pose {pose}: {current_pose_count}/{self.num_per_pose}")
                     else:
-                        last_centers = []
                         self.status_update.emit("Placez votre visage au centre")
                     
-                    # Convert frame to QImage for display
+                    # Preview
                     rgb_display = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
-                    h_frame, w_frame, ch = rgb_display.shape
-                    bytes_per_line = ch * w_frame
-                    qt_img = QImage(rgb_display.data, w_frame, h_frame, bytes_per_line, QImage.Format.Format_RGB888)
+                    qt_img = QImage(rgb_display.data, rgb_display.shape[1], rgb_display.shape[0], rgb_display.shape[1]*3, QImage.Format.Format_RGB888)
                     self.frame_ready.emit(qt_img)
-                    
-                    time.sleep(0.03)  # ~33 FPS
+                    time.sleep(0.03)
                 
-                # Pause between poses
                 if pose_idx < len(self.poses_list) - 1:
-                    self.status_update.emit(f"Pose '{pose}' terminée. Pause de 3s...")
                     time.sleep(3)
         
         finally:
             cap.release()
             if self._running:
-                self.status_update.emit(f"Capture terminée : {self.captured_count} images sauvegardées")
+                self.status_update.emit(f"Capture terminée")
+                # --- UPDATE CLOUD : Fin de capture ---
+                try:
+                    self.table.update_item(
+                        Key={'task_id': self.task_id},
+                        UpdateExpression="set #s = :val, progress = :p",
+                        ExpressionAttributeNames={'#s': 'status'},
+                        ExpressionAttributeValues={':val': 'capture_completed_locally', ':p': 100}
+                    )
+                except: pass
             else:
-                self.status_update.emit("Capture annulée par l'utilisateur")
-    
+                self.status_update.emit("Capture annulée")
+
     def stop(self):
-        """Stop the capture thread."""
         self._running = False
         self.wait()
 
@@ -1161,6 +1186,12 @@ class AuthenticationWorker(QThread):
         self.known_names = known_names
         self.known_poses = known_poses
         self._running = True
+        
+        # Configuration Cloud (à adapter avec tes noms)
+        self.bucket_name = "pfe-face-auth-mariem-778899" # <--- TON NOM DE BUCKET S3
+        self.table_name = "FaceAuthTasks"
+        self.dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+        self.table = self.dynamodb.Table(self.table_name)
 
     def run(self):
         cap = cv2.VideoCapture(0)
@@ -1183,10 +1214,10 @@ class AuthenticationWorker(QThread):
 
         authenticated_user = None
         authentication_succeeded = False
+        task_id = str(uuid.uuid4()) # ID unique pour le suivi Cloud
 
         try:
             while self._running and not authentication_succeeded:
-                # read frame
                 ret, frame = cap.read()
                 if not ret:
                     self.status_update.emit("Erreur lecture caméra")
@@ -1200,7 +1231,6 @@ class AuthenticationWorker(QThread):
                 display = frame.copy()
 
                 if authenticated_user is None:
-                    # try to identify
                     if len(faces) > 0:
                         try:
                             enc = get_face_encoding(rgb_small, faces[0])
@@ -1210,10 +1240,19 @@ class AuthenticationWorker(QThread):
                             if min_distance < FACE_DETECTION_THRESHOLD:
                                 authenticated_user = self.known_names[idx]
                                 self.status_update.emit(f"Identifié: {authenticated_user}")
-                                # ensure poses exist for user
+                                
+                                # --- LINKAGE CLOUD : Création de la tâche ---
+                                self.table.put_item(Item={
+                                    'task_id': task_id,
+                                    'status': 'user_identified',
+                                    'user': authenticated_user,
+                                    'progress': 10
+                                })
+                                # --------------------------------------------
+
                                 user_poses = self.known_poses.get(authenticated_user)
                                 if not user_poses or len(user_poses) == 0:
-                                    self.status_update.emit("Aucune pose enregistrée pour cet utilisateur")
+                                    self.status_update.emit("Aucune pose enregistrée")
                                     authenticated_user = None
                             else:
                                 self.status_update.emit("Inconnu - en attente...")
@@ -1223,131 +1262,99 @@ class AuthenticationWorker(QThread):
                         self.status_update.emit("Aucun visage détecté")
 
                 else:
-                    # run sequence of challenges
                     user_poses = self.known_poses.get(authenticated_user, {})
                     poses_list = list(user_poses.keys())
-                    if not poses_list:
-                        self.status_update.emit("Aucune pose disponible pour l'utilisateur")
-                        authenticated_user = None
-                        continue
-
+                    
                     challenge_index = 0
                     while challenge_index < TOTAL_CHALLENGES and self._running:
                         required_pose = np.random.choice(poses_list)
-                        self.status_update.emit(f"Défi {challenge_index+1}/{TOTAL_CHALLENGES} : Faites la pose '{required_pose}'")
+                        self.status_update.emit(f"Défi {challenge_index+1}/{TOTAL_CHALLENGES} : {required_pose}")
+                        
                         challenge_start = time.time()
                         hold_start = None
                         succeeded = False
 
                         while (time.time() - challenge_start) <= CHALLENGE_TIMEOUT and self._running:
                             ret2, frame2 = cap.read()
-                            if not ret2:
-                                break
+                            if not ret2: break
+                            
                             small2 = cv2.resize(frame2, (0, 0), fx=0.75, fy=0.75)
                             gray2 = cv2.cvtColor(small2, cv2.COLOR_BGR2GRAY)
                             faces2 = detector(gray2, 1)
-                            display2 = frame2.copy()
 
                             if len(faces2) > 0:
                                 face2 = faces2[0]
-                                face_rect_original = dlib.rectangle(
-                                    int(face2.left() / 0.75), int(face2.top() / 0.75),
-                                    int(face2.right() / 0.75), int(face2.bottom() / 0.75)
-                                )
-
-                                landmarks = predictor(frame2, face_rect_original)
+                                face_rect_orig = dlib.rectangle(int(face2.left()/0.75), int(face2.top()/0.75), int(face2.right()/0.75), int(face2.bottom()/0.75))
+                                landmarks = predictor(frame2, face_rect_orig)
                                 yaw, pitch, roll, rvec, tvec = estimate_pose(landmarks, frame2.shape[1], frame2.shape[0])
 
                                 target = user_poses.get(required_pose)
-                                if target is None:
-                                    break
+                                if target is None: break
                                 
-                                # Adaptive tolerances per pose (gauche/droite need wider yaw)
-                                pose_tol = {
-                                    "frontale": (TOLERANCE_YAW, TOLERANCE_PITCH, TOLERANCE_ROLL),
-                                    "gauche": (25, TOLERANCE_PITCH, TOLERANCE_ROLL),
-                                    "droite": (25, TOLERANCE_PITCH, TOLERANCE_ROLL),
-                                    "haut": (TOLERANCE_YAW, 20, TOLERANCE_ROLL),
-                                    "bas": (TOLERANCE_YAW, 20, TOLERANCE_ROLL),
-                                }
-                                tol_yaw, tol_pitch, tol_roll = pose_tol.get(required_pose, (TOLERANCE_YAW, TOLERANCE_PITCH, TOLERANCE_ROLL))
-                                
-                                yaw_err = abs(yaw - target[0])
-                                pitch_err = abs(pitch - target[1])
-                                roll_err = abs(roll - target[2])
-                                
-                                yaw_match = yaw_err < tol_yaw
-                                pitch_match = pitch_err < tol_pitch
-                                roll_match = roll_err < tol_roll
-                                
-                                # DEBUG: show mismatches
-                                diagnostic = f"{required_pose}| Y:{yaw:.1f}→{target[0]:.1f}(Δ{yaw_err:.1f}/{tol_yaw}) P:{pitch:.1f}→{target[1]:.1f}(Δ{pitch_err:.1f}/{tol_pitch}) R:{roll:.1f}→{target[2]:.1f}(Δ{roll_err:.1f}/{tol_roll})"
-                                self.status_update.emit(diagnostic)
-
-                                if yaw_match and pitch_match and roll_match:
-                                    if hold_start is None:
-                                        hold_start = time.time()
-                                    elapsed_hold = time.time() - hold_start
-                                    percent = int(min(100, (elapsed_hold / POSE_DURATION) * 100))
-                                    self.progress_update.emit(percent)
-                                    if elapsed_hold >= POSE_DURATION:
+                                if abs(yaw - target[0]) < 20 and abs(pitch - target[1]) < 20:
+                                    if hold_start is None: hold_start = time.time()
+                                    elapsed = time.time() - hold_start
+                                    self.progress_update.emit(int(min(100, (elapsed / POSE_DURATION) * 100)))
+                                    if elapsed >= POSE_DURATION:
                                         succeeded = True
-                                        self.status_update.emit(f"Défi {challenge_index+1} réussi")
-                                        time.sleep(0.6)
                                         break
                                 else:
                                     hold_start = None
                                     self.progress_update.emit(0)
-                            else:
-                                hold_start = None
-                                self.progress_update.emit(0)
 
-                            # emit current frame
-                            rgb_display = cv2.cvtColor(display2, cv2.COLOR_BGR2RGB)
-                            h, w, ch = rgb_display.shape
-                            bytes_per_line = ch * w
-                            qimg = QImage(rgb_display.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+                            # Affichage flux vidéo
+                            rgb_disp = cv2.cvtColor(frame2, cv2.COLOR_BGR2RGB)
+                            qimg = QImage(rgb_disp.data, frame2.shape[1], frame2.shape[0], frame2.shape[1]*3, QImage.Format.Format_RGB888)
                             self.frame_ready.emit(qimg)
                             time.sleep(0.02)
 
                         if not succeeded:
-                            # challenge failed -> restart entire authentication
-                            self.status_update.emit("Défi échoué : recommencer l'authentification...")
-                            self.progress_update.emit(0)
+                            self.status_update.emit("Défi échoué")
                             authenticated_user = None
-                            time.sleep(1.0)
                             break
                         else:
                             challenge_index += 1
+                            # Mise à jour progression Cloud
+                            self.table.update_item(
+                                Key={'task_id': task_id},
+                                UpdateExpression="set progress = :p",
+                                ExpressionAttributeValues={':p': 50}
+                            )
 
-                    # if all challenges succeeded
                     if challenge_index >= TOTAL_CHALLENGES:
-                        self.status_update.emit(f"Authentification réussie pour {authenticated_user} !")
-                        self.progress_update.emit(100)
-                        time.sleep(1.0)
+                        self.status_update.emit(f"Succès ! Migration vers Cloud...")
+                        
+                        # --- MIGRATION SÉCURISÉE (AES-512) ---
+                        try:
+                            # 1. On prépare une donnée à sécuriser (ex: le log de succès)
+                            secret_data = f"Auth réussie pour {authenticated_user} le {time.ctime()}".encode()
+                            payload, signature = encrypt_aes_512(secret_data)
+                            
+                            # 2. Envoi vers S3
+                            s3_path = f"logs_authentification/{authenticated_user}_{int(time.time())}.bin"
+                            upload_to_s3(payload, signature, self.bucket_name, s3_path)
+                            
+                            # 3. Finalisation DynamoDB
+                            self.table.update_item(
+                                Key={'task_id': task_id},
+                                UpdateExpression="set #s = :val, progress = :p",
+                                ExpressionAttributeNames={'#s': 'status'},
+                                ExpressionAttributeValues={':val': 'finished_and_migrated', ':p': 100}
+                            )
+                            self.status_update.emit("✓ Authentifié et sécurisé sur S3")
+                        except Exception as e:
+                            self.status_update.emit(f"Erreur Cloud: {e}")
+
+                        time.sleep(2.0)
                         authentication_succeeded = True
                         break
-
-                # emit a frame if none emitted in inner loops
-                try:
-                    rgb_display = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
-                    h, w, ch = rgb_display.shape
-                    bytes_per_line = ch * w
-                    qimg = QImage(rgb_display.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-                    self.frame_ready.emit(qimg)
-                except Exception:
-                    pass
 
                 time.sleep(0.02)
 
         finally:
-            try:
-                cap.release()
-            except Exception:
-                pass
+            cap.release()
             self.progress_update.emit(0)
-            self.status_update.emit("Finished")
-            self.frame_ready.emit(QImage())
+            self.status_update.emit("Session terminée")
 
 # --- Bloc principal d'exécution ---
 if __name__ == "__main__":

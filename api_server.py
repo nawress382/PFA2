@@ -4,20 +4,41 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict
-
+import boto3
 import cv2
 from fastapi import BackgroundTasks, FastAPI
 from fastapi.responses import JSONResponse
+from security_utils import encrypt_aes_512, upload_to_s3
+import os
 
 import face_service
-
+dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+table = dynamodb.Table('FaceAuthTasks')
 app = FastAPI(title="Face Auth Service")
 
 # Simple in-memory task manager. Not persistent — fine for local usage.
 TASKS: Dict[str, Dict[str, Any]] = {}
 _EXECUTOR = ThreadPoolExecutor(max_workers=2)
 _LOCK = threading.Lock()
-
+def migrate_user_to_cloud(user_name: str):
+    bucket_name = "ton-nom-de-bucket-ici" # <--- METS TON NOM DE BUCKET ICI
+    
+    # On imagine qu'on migre le fichier d'encodings ou une image
+    file_path = f"dataset/{user_name}/face_data.pkl" # ou le chemin de ton choix
+    
+    if os.path.exists(file_path):
+        with open(file_path, "rb") as f:
+            data = f.read()
+            
+        # 1. Chiffrement AES-512 (Double AES-256)
+        payload, signature = encrypt_aes_512(data)
+        
+        # 2. Migration vers S3
+        s3_name = f"cloud_storage/{user_name}_secure_data.bin"
+        success = upload_to_s3(payload, signature, bucket_name, s3_name)
+        
+        return success
+    return False
 
 def _encode_frame_to_b64(frame_bgr) -> str:
     """Encode BGR frame (numpy) to JPEG-base64 string."""
@@ -32,10 +53,28 @@ def _encode_frame_to_b64(frame_bgr) -> str:
 
 
 def _update_task(task_id: str, **kwargs):
+    # 1. On garde la mise à jour locale (optionnel, pour le debug)
     with _LOCK:
         TASKS.setdefault(task_id, {})
         TASKS[task_id].update(kwargs)
-
+    
+    # 2. On envoie les données vers AWS DynamoDB
+    # On transforme les données pour qu'elles plaisent à DynamoDB
+    try:
+        status = str(kwargs.get('status', TASKS[task_id].get('status', '')))
+        progress = int(kwargs.get('progress', TASKS[task_id].get('progress', 0)))
+        
+        table.put_item(
+            Item={
+                'task_id': task_id,
+                'status': status,
+                'progress': progress,
+                # On peut ajouter d'autres infos si besoin
+            }
+        )
+        print(f"Cloud: Task {task_id} mise à jour sur AWS.")
+    except Exception as e:
+        print(f"Erreur Cloud DynamoDB: {e}")
 
 def _capture_worker(task_id: str, user_name: str, num_images_per_pose: int, output_dir: str, camera_index: int):
     try:
@@ -56,7 +95,15 @@ def _capture_worker(task_id: str, user_name: str, num_images_per_pose: int, outp
             output_dir=output_dir,
             camera_index=camera_index,
             progress_callback=progress_cb,
-        )
+        )# Une fois la capture finie, on lance la migration sécurisée
+        _update_task(task_id, status="migrating_to_cloud")
+        migration_ok = migrate_user_to_cloud(user_name)
+        
+        if migration_ok:
+            _update_task(task_id, status="finished_and_migrated", progress=100)
+        else:
+            _update_task(task_id, status="finished_local_only", error="Migration failed")
+            
         _update_task(task_id, status="finished", result=result, progress=100)
     except Exception as e:
         _update_task(task_id, status="error", error=str(e))
@@ -125,11 +172,14 @@ def start_authenticate(camera_index: int = 0, total_challenges: int = 5, challen
 
 @app.get("/tasks/{task_id}")
 def get_task(task_id: str):
-    t = TASKS.get(task_id)
-    if t is None:
-        return JSONResponse(status_code=404, content={"error": "task not found"})
-    return t
-
+    # On va chercher l'info sur AWS DynamoDB
+    response = table.get_item(Key={'task_id': task_id})
+    item = response.get('Item')
+    
+    if not item:
+        return JSONResponse(status_code=404, content={"error": "Task not found on AWS"})
+    
+    return item
 
 @app.get("/dataset")
 def dataset_list():
