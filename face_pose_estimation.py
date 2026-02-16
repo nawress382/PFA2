@@ -12,6 +12,9 @@ from PyQt6.QtCore import QTimer, Qt, pyqtSignal, QThread
 import boto3
 from security_utils import encrypt_aes_512, upload_to_s3
 import uuid  # <--- CELUI QUI MANQUAIT
+from security_utils import generate_and_upload_qr
+
+
 
 # Import the headless service functions for business logic (API-friendly)
 from face_service import (
@@ -401,6 +404,73 @@ class CaptureDialog(QDialog):
             Qt.AspectRatioMode.KeepAspectRatioByExpanding, 
             Qt.TransformationMode.SmoothTransformation
         ))
+class QRCodeDialog(QDialog):
+    def __init__(self, qr_data_bytes, trust_code, task_id, parent=None):
+        super().__init__(parent)
+        # On stocke le task_id pour pouvoir interroger DynamoDB
+        self.task_id = task_id 
+        
+        self.setWindowTitle("Second Facteur d'Authentification")
+        self.setFixedSize(400, 500) # Un peu plus grand pour le statut
+        self.setStyleSheet("background-color: #ffffff; color: #000000;")
+        
+        layout = QVBoxLayout()
+        
+        self.label_info = QLabel("Authentification Réussie !\nScannez ce code avec votre mobile.")
+        self.label_info.setStyleSheet("font-weight: bold; font-size: 14px; color: #1e293b;")
+        self.label_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.label_info)
+
+        # Affichage du QR Code
+        self.qr_label = QLabel()
+        qimg = QImage.fromData(qr_data_bytes)
+        pixmap = QPixmap.fromImage(qimg)
+        self.qr_label.setPixmap(pixmap.scaled(300, 300, Qt.AspectRatioMode.KeepAspectRatio))
+        self.qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.qr_label)
+        
+        # Affichage du code de confiance (Trust Code)
+        self.label_code = QLabel(f"ID Session : {trust_code}")
+        self.label_code.setStyleSheet("color: #64748b; font-size: 11px;")
+        self.label_code.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.label_code)
+
+        # Indicateur d'attente (Status du Cloud)
+        self.label_cloud_status = QLabel("⏳ En attente de validation mobile...")
+        self.label_cloud_status.setStyleSheet("color: #3a7afe; font-weight: bold; margin-top: 10px;")
+        self.label_cloud_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.label_cloud_status)
+        
+        self.setLayout(layout)
+
+        # --- INITIALISATION DU POLLING CLOUD ---
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.check_cloud_status)
+        self.timer.start(2000) # On vérifie toutes les 2 secondes (2000 ms)
+
+    def check_cloud_status(self):
+        """Vérifie dans DynamoDB si le statut est passé à 'authorized'."""
+        try:
+            import boto3
+            # Connexion à la table
+            dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+            table = dynamodb.Table('FaceAuthTasks')
+            
+            # Lecture de la tâche
+            response = table.get_item(Key={'task_id': self.task_id})
+            item = response.get('Item')
+            
+            if item and item.get('status') == 'authorized':
+                # Si le mobile a validé :
+                self.timer.stop() # On arrête le timer
+                self.label_cloud_status.setText("✅ ACCÈS AUTORISÉ !")
+                self.label_cloud_status.setStyleSheet("color: #10b981; font-weight: bold;")
+                
+                # Petite pause pour que l'utilisateur voit le message de succès
+                QTimer.singleShot(1500, self.accept) # Ferme la fenêtre proprement
+        
+        except Exception as e:
+            print(f"Erreur lors du polling Cloud : {e}")
 class FaceAuthApp(QWidget):
     def __init__(self):
         super().__init__()
@@ -597,7 +667,20 @@ class FaceAuthApp(QWidget):
             qt_image = QImage(crop.data, rw, rh, bytes_per_line, QImage.Format.Format_RGB888)
             pix = QPixmap.fromImage(qt_image)
             self.video_label.setPixmap(pix)
-    
+
+    def show_qr_code(self, qr_bytes, trust_code):
+        """Affiche le QR Code et attend la validation mobile."""
+        # On récupère le task_id actuel depuis le worker
+        current_task_id = self.auth_worker.task_id 
+        
+        # On crée le dialogue en lui passant les 3 infos
+        dialog = QRCodeDialog(qr_bytes, trust_code, current_task_id, self)
+        
+        # dialog.exec() bloque l'appli jusqu'à ce que self.accept() soit appelé (le scan réussi)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.status_label.setText("✅ Accès accordé par le mobile !")
+            # Ici tu peux ajouter une action finale (ouvrir un dossier, etc.)
+      
     def capture_images(self):
         # Demander le nom de l'utilisateur et le nombre d'images par pose via la GUI
         name, ok = QInputDialog.getText(self, "Nom utilisateur", "Entrez le nom de l'utilisateur:")
@@ -626,6 +709,7 @@ class FaceAuthApp(QWidget):
             self.auth_worker.status_update.connect(self._on_auth_status)
             self.auth_worker.progress_update.connect(self._on_auth_progress)
             self.auth_worker.finished.connect(self._on_auth_finished)
+            self.auth_worker.qr_signal.connect(self.show_qr_code)
             self.auth_worker.start()
         else:
             # Si déjà en cours, ignorer ou arrêter
@@ -1179,6 +1263,7 @@ class AuthenticationWorker(QThread):
     frame_ready = pyqtSignal(QImage)
     status_update = pyqtSignal(str)
     progress_update = pyqtSignal(int)
+    qr_signal = pyqtSignal(bytes, str)
 
     def __init__(self, known_encodings, known_names, known_poses, parent=None):
         super().__init__(parent)
@@ -1188,7 +1273,7 @@ class AuthenticationWorker(QThread):
         self._running = True
         
         # Configuration Cloud (à adapter avec tes noms)
-        self.bucket_name = "pfe-face-auth-mariem-778899" # <--- TON NOM DE BUCKET S3
+        self.bucket_name = MON_BUCKET # <--- TON NOM DE BUCKET S3
         self.table_name = "FaceAuthTasks"
         self.dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
         self.table = self.dynamodb.Table(self.table_name)
@@ -1214,7 +1299,7 @@ class AuthenticationWorker(QThread):
 
         authenticated_user = None
         authentication_succeeded = False
-        task_id = str(uuid.uuid4()) # ID unique pour le suivi Cloud
+        self.task_id = str(uuid.uuid4()) 
 
         try:
             while self._running and not authentication_succeeded:
@@ -1227,7 +1312,6 @@ class AuthenticationWorker(QThread):
                 rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
                 gray_small = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
                 faces = detector(gray_small, 1)
-
                 display = frame.copy()
 
                 if authenticated_user is None:
@@ -1241,14 +1325,12 @@ class AuthenticationWorker(QThread):
                                 authenticated_user = self.known_names[idx]
                                 self.status_update.emit(f"Identifié: {authenticated_user}")
                                 
-                                # --- LINKAGE CLOUD : Création de la tâche ---
                                 self.table.put_item(Item={
-                                    'task_id': task_id,
+                                    'task_id': self.task_id,
                                     'status': 'user_identified',
                                     'user': authenticated_user,
                                     'progress': 10
                                 })
-                                # --------------------------------------------
 
                                 user_poses = self.known_poses.get(authenticated_user)
                                 if not user_poses or len(user_poses) == 0:
@@ -1302,7 +1384,6 @@ class AuthenticationWorker(QThread):
                                     hold_start = None
                                     self.progress_update.emit(0)
 
-                            # Affichage flux vidéo
                             rgb_disp = cv2.cvtColor(frame2, cv2.COLOR_BGR2RGB)
                             qimg = QImage(rgb_disp.data, frame2.shape[1], frame2.shape[0], frame2.shape[1]*3, QImage.Format.Format_RGB888)
                             self.frame_ready.emit(qimg)
@@ -1314,34 +1395,47 @@ class AuthenticationWorker(QThread):
                             break
                         else:
                             challenge_index += 1
-                            # Mise à jour progression Cloud
                             self.table.update_item(
-                                Key={'task_id': task_id},
+                                Key={'task_id': self.task_id},
                                 UpdateExpression="set progress = :p",
                                 ExpressionAttributeValues={':p': 50}
                             )
 
                     if challenge_index >= TOTAL_CHALLENGES:
-                        self.status_update.emit(f"Succès ! Migration vers Cloud...")
+                        print("DEBUG: Défis réussis ! Tentative de génération QR...") # <--- AJOUTE ÇA
+                        self.status_update.emit(f"Succès ! Sécurisation et MFA...")
                         
-                        # --- MIGRATION SÉCURISÉE (AES-512) ---
                         try:
-                            # 1. On prépare une donnée à sécuriser (ex: le log de succès)
+                            # 1. Migration S3 (Déjà fait)
                             secret_data = f"Auth réussie pour {authenticated_user} le {time.ctime()}".encode()
                             payload, signature = encrypt_aes_512(secret_data)
-                            
-                            # 2. Envoi vers S3
                             s3_path = f"logs_authentification/{authenticated_user}_{int(time.time())}.bin"
                             upload_to_s3(payload, signature, self.bucket_name, s3_path)
                             
-                            # 3. Finalisation DynamoDB
+                            # 2. GÉNÉRATION DU QR CODE (NOUVEAU)
+                            # On génère le trust_code et l'image du QR
+                            print(f"DEBUG: Appel de generate_and_upload_qr pour {authenticated_user}") # <--- AJOUTE ÇA
+                            trust_code, qr_bytes = generate_and_upload_qr(authenticated_user, self.bucket_name, self.task_id)
+                            print(f"DEBUG: QR Généré avec succès. Code: {trust_code}")
+
+                            
+                            # 3. MISE À JOUR DYNAMODB AVEC LE TRUST_CODE
                             self.table.update_item(
-                                Key={'task_id': task_id},
-                                UpdateExpression="set #s = :val, progress = :p",
+                                Key={'task_id': self.task_id},
+                                UpdateExpression="set #s = :val, progress = :p, trust_code = :tc",
                                 ExpressionAttributeNames={'#s': 'status'},
-                                ExpressionAttributeValues={':val': 'finished_and_migrated', ':p': 100}
+                                ExpressionAttributeValues={
+                                    ':val': 'mfa_pending', 
+                                    ':p': 100,
+                                    ':tc': trust_code
+                                }
                             )
-                            self.status_update.emit("✓ Authentifié et sécurisé sur S3")
+
+                            # 4. ENVOI DU SIGNAL POUR AFFICHER LE QR DANS L'INTERFACE
+                            print("DEBUG: Envoi du signal qr_signal...")
+                            self.qr_signal.emit(qr_bytes, trust_code)
+                            self.status_update.emit("✓ Authentifié. Scannez le QR Code.")
+
                         except Exception as e:
                             self.status_update.emit(f"Erreur Cloud: {e}")
 
