@@ -13,6 +13,8 @@ import boto3
 from security_utils import encrypt_aes_512, upload_to_s3
 import uuid  # <--- CELUI QUI MANQUAIT
 from security_utils import generate_and_upload_qr
+import webbrowser
+
 
 
 
@@ -669,17 +671,26 @@ class FaceAuthApp(QWidget):
             self.video_label.setPixmap(pix)
 
     def show_qr_code(self, qr_bytes, trust_code):
-        """Affiche le QR Code et attend la validation mobile."""
+        """Affiche le QR Code, cache l'appli principale et attend la validation mobile."""
         # On récupère le task_id actuel depuis le worker
+        self.hide()
         current_task_id = self.auth_worker.task_id 
-        
+        authenticated_user = self.auth_worker.authenticated_user 
+
         # On crée le dialogue en lui passant les 3 infos
         dialog = QRCodeDialog(qr_bytes, trust_code, current_task_id, self)
         
         # dialog.exec() bloque l'appli jusqu'à ce que self.accept() soit appelé (le scan réussi)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.status_label.setText("✅ Accès accordé par le mobile !")
+            self.status_label.setText("✅ Accès accordé ! Redirection...")
             # Ici tu peux ajouter une action finale (ouvrir un dossier, etc.)
+            base_url = "https://ppppzr4jwi.execute-api.us-east-1.amazonaws.com/default/CloudVaultInterface"
+            vault_url = f"{base_url}?user={authenticated_user}"            
+            webbrowser.open(vault_url)
+            QApplication.quit() 
+        else:
+            # Si l'utilisateur a fermé la fenêtre QR sans scanner, on réaffiche l'appli
+            self.show()
       
     def capture_images(self):
         # Demander le nom de l'utilisateur et le nombre d'images par pose via la GUI
