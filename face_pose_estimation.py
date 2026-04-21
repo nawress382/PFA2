@@ -6,7 +6,7 @@ import math
 import time
 from sklearn.neighbors import NearestNeighbors
 import sys
-from PyQt6.QtWidgets import QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QInputDialog, QProgressBar, QGraphicsDropShadowEffect, QDialog, QFrame
+from PyQt6.QtWidgets import QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout, QInputDialog, QProgressBar, QGraphicsDropShadowEffect, QDialog, QFrame, QLineEdit
 from PyQt6.QtGui import QPixmap, QImage, QColor
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal, QThread
 import boto3
@@ -409,70 +409,99 @@ class CaptureDialog(QDialog):
 class QRCodeDialog(QDialog):
     def __init__(self, qr_data_bytes, trust_code, task_id, parent=None):
         super().__init__(parent)
-        # On stocke le task_id pour pouvoir interroger DynamoDB
         self.task_id = task_id 
-        
-        self.setWindowTitle("Second Facteur d'Authentification")
-        self.setFixedSize(400, 500) # Un peu plus grand pour le statut
-        self.setStyleSheet("background-color: #ffffff; color: #000000;")
+        self.correct_code = trust_code.upper() # Le code généré
+        self.time_left = 60 # 60 secondes
+
+        self.setWindowTitle("Validation Double Facteur (MFA)")
+        self.setFixedSize(450, 650)
+        self.setStyleSheet("background-color: #0f172a; color: white;")
         
         layout = QVBoxLayout()
-        
-        self.label_info = QLabel("Authentification Réussie !\nScannez ce code avec votre mobile.")
-        self.label_info.setStyleSheet("font-weight: bold; font-size: 14px; color: #1e293b;")
-        self.label_info.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.label_info)
+        layout.setContentsMargins(30, 30, 30, 30)
 
-        # Affichage du QR Code
+        # 1. Chronomètre
+        self.timer_label = QLabel(f"Temps restant : {self.time_left}s")
+        self.timer_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #f87171;")
+        self.timer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.timer_label)
+
+        # 2. QR Code
         self.qr_label = QLabel()
         qimg = QImage.fromData(qr_data_bytes)
         pixmap = QPixmap.fromImage(qimg)
-        self.qr_label.setPixmap(pixmap.scaled(300, 300, Qt.AspectRatioMode.KeepAspectRatio))
+        self.qr_label.setPixmap(pixmap.scaled(250, 250, Qt.AspectRatioMode.KeepAspectRatio))
         self.qr_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self.qr_label)
-        
-        # Affichage du code de confiance (Trust Code)
-        self.label_code = QLabel(f"ID Session : {trust_code}")
-        self.label_code.setStyleSheet("color: #64748b; font-size: 11px;")
-        self.label_code.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.label_code)
 
-        # Indicateur d'attente (Status du Cloud)
-        self.label_cloud_status = QLabel("⏳ En attente de validation mobile...")
-        self.label_cloud_status.setStyleSheet("color: #3a7afe; font-weight: bold; margin-top: 10px;")
-        self.label_cloud_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.label_cloud_status)
-        
+        msg = QLabel("Scannez le code avec votre mobile et\nsaisissez le code de confiance affiché :")
+        msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        msg.setStyleSheet("color: #94a3b8; font-size: 14px;")
+        layout.addWidget(msg)
+
+        # 3. Champ de saisie
+        self.input_field = QLineEdit()
+        self.input_field.setPlaceholderText("TR-XXX-XXX")
+        self.input_field.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.input_field.setStyleSheet("""
+            QLineEdit {
+                background-color: #1e293b;
+                border: 2px solid #334155;
+                border-radius: 10px;
+                padding: 12px;
+                font-size: 24px;
+                font-weight: bold;
+                color: #38bdf8;
+                margin-top: 10px;
+            }
+        """)
+        self.input_field.textChanged.connect(self.verify_code)
+        layout.addWidget(self.input_field)
+
+        # 4. Bouton de validation
+        self.btn_next = QPushButton("Continuer vers la migration")
+        self.btn_next.setEnabled(False) # Bloqué au début
+        self.btn_next.setStyleSheet("""
+            QPushButton {
+                background-color: #334155;
+                color: #64748b;
+                font-size: 16px;
+                font-weight: bold;
+                padding: 15px;
+                border-radius: 10px;
+                margin-top: 20px;
+            }
+            QPushButton:enabled {
+                background-color: #10b981;
+                color: white;
+            }
+        """)
+        self.btn_next.clicked.connect(self.accept)
+        layout.addWidget(self.btn_next)
+
         self.setLayout(layout)
 
-        # --- INITIALISATION DU POLLING CLOUD ---
+        # Lancer le compte à rebours
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.check_cloud_status)
-        self.timer.start(2000) # On vérifie toutes les 2 secondes (2000 ms)
+        self.timer.timeout.connect(self.update_timer)
+        self.timer.start(1000)
 
-    def check_cloud_status(self):
-        """Vérifie dans DynamoDB si le statut est passé à 'authorized'."""
-        try:
-            import boto3
-            # Connexion à la table
-            dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
-            table = dynamodb.Table('FaceAuthTasks')
+    def update_timer(self):
+        self.time_left -= 1
+        self.timer_label.setText(f"Temps restant : {self.time_left}s")
+        if self.time_left <= 0:
+            self.timer.stop()
+            self.reject() # Ferme la fenêtre si temps écoulé
+
+    def verify_code(self):
+        """Vérifie si le code saisi correspond au code généré."""
+        typed = self.input_field.text().strip().upper()
+        if typed == self.correct_code:
+            self.btn_next.setEnabled(True)
+            self.input_field.setStyleSheet("background-color: #064e3b; border: 2px solid #10b981; border-radius: 10px; padding: 12px; font-size: 24px; color: white;")
+        else:
+            self.btn_next.setEnabled(False)
             
-            # Lecture de la tâche
-            response = table.get_item(Key={'task_id': self.task_id})
-            item = response.get('Item')
-            
-            if item and item.get('status') == 'authorized':
-                # Si le mobile a validé :
-                self.timer.stop() # On arrête le timer
-                self.label_cloud_status.setText("✅ ACCÈS AUTORISÉ !")
-                self.label_cloud_status.setStyleSheet("color: #10b981; font-weight: bold;")
-                
-                # Petite pause pour que l'utilisateur voit le message de succès
-                QTimer.singleShot(1500, self.accept) # Ferme la fenêtre proprement
-        
-        except Exception as e:
-            print(f"Erreur lors du polling Cloud : {e}")
 class FaceAuthApp(QWidget):
     def __init__(self):
         super().__init__()
@@ -675,8 +704,7 @@ class FaceAuthApp(QWidget):
         # On récupère le task_id actuel depuis le worker
         self.hide()
         current_task_id = self.auth_worker.task_id 
-        authenticated_user = self.auth_worker.authenticated_user 
-
+        authenticated_user = getattr(self.auth_worker, 'authenticated_user', 'Utilisateur')
         # On crée le dialogue en lui passant les 3 infos
         dialog = QRCodeDialog(qr_bytes, trust_code, current_task_id, self)
         
@@ -1284,13 +1312,15 @@ class AuthenticationWorker(QThread):
         self._running = True
         
         # Configuration Cloud (à adapter avec tes noms)
+        
+        self.authenticated_user = None
         self.bucket_name = MON_BUCKET # <--- TON NOM DE BUCKET S3
         self.table_name = "FaceAuthTasks"
         self.dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
         self.table = self.dynamodb.Table(self.table_name)
 
     def run(self):
-        cap = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
         if not cap.isOpened():
             self.status_update.emit("Erreur : Impossible d'ouvrir la caméra.")
             return
@@ -1325,7 +1355,7 @@ class AuthenticationWorker(QThread):
                 faces = detector(gray_small, 1)
                 display = frame.copy()
 
-                if authenticated_user is None:
+                if self.authenticated_user is None:
                     if len(faces) > 0:
                         try:
                             enc = get_face_encoding(rgb_small, faces[0])
@@ -1333,13 +1363,14 @@ class AuthenticationWorker(QThread):
                             min_distance = distances[0][0]
                             idx = indices[0][0]
                             if min_distance < FACE_DETECTION_THRESHOLD:
-                                authenticated_user = self.known_names[idx]
+                                self.authenticated_user = self.known_names[idx]
+                                authenticated_user = self.authenticated_user
                                 self.status_update.emit(f"Identifié: {authenticated_user}")
                                 
                                 self.table.put_item(Item={
                                     'task_id': self.task_id,
                                     'status': 'user_identified',
-                                    'user': authenticated_user,
+                                    'user': self.authenticated_user,
                                     'progress': 10
                                 })
 
@@ -1358,101 +1389,105 @@ class AuthenticationWorker(QThread):
                     user_poses = self.known_poses.get(authenticated_user, {})
                     poses_list = list(user_poses.keys())
                     
-                    challenge_index = 0
-                    while challenge_index < TOTAL_CHALLENGES and self._running:
-                        required_pose = np.random.choice(poses_list)
-                        self.status_update.emit(f"Défi {challenge_index+1}/{TOTAL_CHALLENGES} : {required_pose}")
-                        
-                        challenge_start = time.time()
-                        hold_start = None
-                        succeeded = False
-
-                        while (time.time() - challenge_start) <= CHALLENGE_TIMEOUT and self._running:
-                            ret2, frame2 = cap.read()
-                            if not ret2: break
+                    if not poses_list:
+                        self.status_update.emit("Aucune pose enregistrée pour ce utilisateur")
+                        authenticated_user = None
+                    else:
+                        challenge_index = 0
+                        while challenge_index < TOTAL_CHALLENGES and self._running:
+                            required_pose = np.random.choice(poses_list)
+                            self.status_update.emit(f"Défi {challenge_index+1}/{TOTAL_CHALLENGES} : {required_pose}")
                             
-                            small2 = cv2.resize(frame2, (0, 0), fx=0.75, fy=0.75)
-                            gray2 = cv2.cvtColor(small2, cv2.COLOR_BGR2GRAY)
-                            faces2 = detector(gray2, 1)
+                            challenge_start = time.time()
+                            hold_start = None
+                            succeeded = False
 
-                            if len(faces2) > 0:
-                                face2 = faces2[0]
-                                face_rect_orig = dlib.rectangle(int(face2.left()/0.75), int(face2.top()/0.75), int(face2.right()/0.75), int(face2.bottom()/0.75))
-                                landmarks = predictor(frame2, face_rect_orig)
-                                yaw, pitch, roll, rvec, tvec = estimate_pose(landmarks, frame2.shape[1], frame2.shape[0])
-
-                                target = user_poses.get(required_pose)
-                                if target is None: break
+                            while (time.time() - challenge_start) <= CHALLENGE_TIMEOUT and self._running:
+                                ret2, frame2 = cap.read()
+                                if not ret2: break
                                 
-                                if abs(yaw - target[0]) < 20 and abs(pitch - target[1]) < 20:
-                                    if hold_start is None: hold_start = time.time()
-                                    elapsed = time.time() - hold_start
-                                    self.progress_update.emit(int(min(100, (elapsed / POSE_DURATION) * 100)))
-                                    if elapsed >= POSE_DURATION:
-                                        succeeded = True
-                                        break
-                                else:
-                                    hold_start = None
-                                    self.progress_update.emit(0)
+                                small2 = cv2.resize(frame2, (0, 0), fx=0.75, fy=0.75)
+                                gray2 = cv2.cvtColor(small2, cv2.COLOR_BGR2GRAY)
+                                faces2 = detector(gray2, 1)
 
-                            rgb_disp = cv2.cvtColor(frame2, cv2.COLOR_BGR2RGB)
-                            qimg = QImage(rgb_disp.data, frame2.shape[1], frame2.shape[0], frame2.shape[1]*3, QImage.Format.Format_RGB888)
-                            self.frame_ready.emit(qimg)
-                            time.sleep(0.02)
+                                if len(faces2) > 0:
+                                    face2 = faces2[0]
+                                    face_rect_orig = dlib.rectangle(int(face2.left()/0.75), int(face2.top()/0.75), int(face2.right()/0.75), int(face2.bottom()/0.75))
+                                    landmarks = predictor(frame2, face_rect_orig)
+                                    yaw, pitch, roll, rvec, tvec = estimate_pose(landmarks, frame2.shape[1], frame2.shape[0])
 
-                        if not succeeded:
-                            self.status_update.emit("Défi échoué")
-                            authenticated_user = None
+                                    target = user_poses.get(required_pose)
+                                    if target is None: break
+                                    
+                                    if abs(yaw - target[0]) < 20 and abs(pitch - target[1]) < 20:
+                                        if hold_start is None: hold_start = time.time()
+                                        elapsed = time.time() - hold_start
+                                        self.progress_update.emit(int(min(100, (elapsed / POSE_DURATION) * 100)))
+                                        if elapsed >= POSE_DURATION:
+                                            succeeded = True
+                                            break
+                                    else:
+                                        hold_start = None
+                                        self.progress_update.emit(0)
+
+                                rgb_disp = cv2.cvtColor(frame2, cv2.COLOR_BGR2RGB)
+                                qimg = QImage(rgb_disp.data, frame2.shape[1], frame2.shape[0], frame2.shape[1]*3, QImage.Format.Format_RGB888)
+                                self.frame_ready.emit(qimg)
+                                time.sleep(0.02)
+
+                            if not succeeded:
+                                self.status_update.emit("Défi échoué")
+                                authenticated_user = None
+                                break
+                            else:
+                                challenge_index += 1
+                                self.table.update_item(
+                                    Key={'task_id': self.task_id},
+                                    UpdateExpression="set progress = :p",
+                                    ExpressionAttributeValues={':p': 50}
+                                )
+
+                        if challenge_index >= TOTAL_CHALLENGES:
+                            print("DEBUG: Défis réussis ! Tentative de génération QR...") # <--- AJOUTE ÇA
+                            self.status_update.emit(f"Succès ! Sécurisation et MFA...")
+                            
+                            try:
+                                # 1. Migration S3 (Déjà fait)
+                                secret_data = f"Auth réussie pour {authenticated_user} le {time.ctime()}".encode()
+                                payload, signature = encrypt_aes_512(secret_data)
+                                s3_path = f"logs_authentification/{authenticated_user}_{int(time.time())}.bin"
+                                upload_to_s3(payload, signature, self.bucket_name, s3_path)
+                                
+                                # 2. GÉNÉRATION DU QR CODE (NOUVEAU)
+                                # On génère le trust_code et l'image du QR
+                                print(f"DEBUG: Appel de generate_and_upload_qr pour {authenticated_user}") # <--- AJOUTE ÇA
+                                trust_code, qr_bytes = generate_and_upload_qr(authenticated_user, self.bucket_name, self.task_id)
+                                print(f"DEBUG: QR Généré avec succès. Code: {trust_code}")
+
+                                
+                                # 3. MISE À JOUR DYNAMODB AVEC LE TRUST_CODE
+                                self.table.update_item(
+                                    Key={'task_id': self.task_id},
+                                    UpdateExpression="set #s = :val, progress = :p, trust_code = :tc",
+                                    ExpressionAttributeNames={'#s': 'status'},
+                                    ExpressionAttributeValues={
+                                        ':val': 'mfa_pending', 
+                                        ':p': 100,
+                                        ':tc': trust_code
+                                    }
+                                )
+
+                                # 4. ENVOI DU SIGNAL POUR AFFICHER LE QR DANS L'INTERFACE
+                                print("DEBUG: Envoi du signal qr_signal...")
+                                self.qr_signal.emit(qr_bytes, trust_code)
+                                self.status_update.emit("✓ Authentifié. Scannez le QR Code.")
+
+                            except Exception as e:
+                                self.status_update.emit(f"Erreur Cloud: {e}")
+
+                            time.sleep(2.0)
+                            authentication_succeeded = True
                             break
-                        else:
-                            challenge_index += 1
-                            self.table.update_item(
-                                Key={'task_id': self.task_id},
-                                UpdateExpression="set progress = :p",
-                                ExpressionAttributeValues={':p': 50}
-                            )
-
-                    if challenge_index >= TOTAL_CHALLENGES:
-                        print("DEBUG: Défis réussis ! Tentative de génération QR...") # <--- AJOUTE ÇA
-                        self.status_update.emit(f"Succès ! Sécurisation et MFA...")
-                        
-                        try:
-                            # 1. Migration S3 (Déjà fait)
-                            secret_data = f"Auth réussie pour {authenticated_user} le {time.ctime()}".encode()
-                            payload, signature = encrypt_aes_512(secret_data)
-                            s3_path = f"logs_authentification/{authenticated_user}_{int(time.time())}.bin"
-                            upload_to_s3(payload, signature, self.bucket_name, s3_path)
-                            
-                            # 2. GÉNÉRATION DU QR CODE (NOUVEAU)
-                            # On génère le trust_code et l'image du QR
-                            print(f"DEBUG: Appel de generate_and_upload_qr pour {authenticated_user}") # <--- AJOUTE ÇA
-                            trust_code, qr_bytes = generate_and_upload_qr(authenticated_user, self.bucket_name, self.task_id)
-                            print(f"DEBUG: QR Généré avec succès. Code: {trust_code}")
-
-                            
-                            # 3. MISE À JOUR DYNAMODB AVEC LE TRUST_CODE
-                            self.table.update_item(
-                                Key={'task_id': self.task_id},
-                                UpdateExpression="set #s = :val, progress = :p, trust_code = :tc",
-                                ExpressionAttributeNames={'#s': 'status'},
-                                ExpressionAttributeValues={
-                                    ':val': 'mfa_pending', 
-                                    ':p': 100,
-                                    ':tc': trust_code
-                                }
-                            )
-
-                            # 4. ENVOI DU SIGNAL POUR AFFICHER LE QR DANS L'INTERFACE
-                            print("DEBUG: Envoi du signal qr_signal...")
-                            self.qr_signal.emit(qr_bytes, trust_code)
-                            self.status_update.emit("✓ Authentifié. Scannez le QR Code.")
-
-                        except Exception as e:
-                            self.status_update.emit(f"Erreur Cloud: {e}")
-
-                        time.sleep(2.0)
-                        authentication_succeeded = True
-                        break
 
                 time.sleep(0.02)
 

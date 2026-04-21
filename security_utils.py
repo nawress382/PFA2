@@ -7,6 +7,8 @@ import qrcode
 import io
 import uuid
 import boto3
+import random
+import string
 
 # Utilisons une méthode plus sûre pour générer une clé de 512 bits (64 octets)
 # à partir de n'importe quel texte :
@@ -51,44 +53,32 @@ def upload_to_s3(payload, signature, bucket_name, s3_file_name):
         print(f"Erreur S3: {e}")
         return False
 def generate_and_upload_qr(user_name, bucket_name, task_id):
-    """Génère un QR code contenant un lien de validation mobile, l'envoie sur S3."""
+    """Génère un code aléatoire et un QR code contenant l'URL de validation."""
     
+    # 1. Générer un code aléatoire format TR-XXX-XXX
+    part1 = ''.join(random.choices(string.ascii_uppercase + string.digits, k=3))
+    part2 = ''.join(random.choices(string.digits, k=3))
+    random_trust_code = f"TR-{part1}-{part2}"
 
-    # 1. TON URL API GATEWAY (Remplace par celle que tu as copiée sur AWS)
-    # Exemple : https://abcd123.execute-api.us-east-1.amazonaws.com/default/VerifyMFATask
-    api_url = " https://z9v2z7b41e.execute-api.us-east-1.amazonaws.com/default/VerifyMFATask"
+    # 2. Construire l'URL avec le code en paramètre pour la Lambda
+    api_url = "https://z9v2z7b41e.execute-api.us-east-1.amazonaws.com/default/VerifyMFATask"
+    url_validation = f"{api_url}?task_id={task_id}&code={random_trust_code}"
     
-    # On construit le lien de validation final
-    url_validation = f"{api_url}?task_id={task_id}"
-    
-    # 2. Créer une signature de secours (Trust Code)
-    trust_code = f"TRUST-{user_name}-{uuid.uuid4().hex[:4].upper()}"
-
-    # 3. Générer l'image du QR Code avec l'URL de validation
+    # 3. Générer l'image du QR Code
     qr = qrcode.QRCode(version=1, box_size=10, border=5)
-    qr.add_data(url_validation) # <-- C'est l'URL que le téléphone va scanner
+    qr.add_data(url_validation)
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
     
-    # 4. Sauvegarder l'image dans un buffer
     img_buffer = io.BytesIO()
     img.save(img_buffer, format='PNG')
     qr_bytes = img_buffer.getvalue()
-    img_buffer.seek(0)
     
-    # 5. Envoi vers S3
+    # 4. (Optionnel) Upload vers S3 pour garder une trace
     try:
         s3 = boto3.client('s3')
-        s3_path = f"qr_codes/{user_name}_auth_qr.png"
-        s3.put_object(
-            Bucket=bucket_name, 
-            Key=s3_path, 
-            Body=img_buffer, 
-            ContentType='image/png'
-        )
-        print(f"DEBUG: QR Code (URL) envoyé sur S3 avec succès.")
-    except Exception as e:
-        print(f"Erreur S3 QR Code: {e}")
+        s3.put_object(Bucket=bucket_name, Key=f"qr_codes/{user_name}_auth_qr.png", Body=qr_bytes, ContentType='image/png')
+    except: pass
     
-    # On retourne l'URL (pour info) et les bytes de l'image (pour l'affichage PyQt6)
-    return url_validation, qr_bytes
+    # On retourne le code (pour le PC) et l'image (pour l'affichage)
+    return random_trust_code, qr_bytes
