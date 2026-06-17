@@ -1437,8 +1437,21 @@ class AuthenticationWorker(QThread):
 
                             if not succeeded:
                                 self.status_update.emit("Défi échoué")
+                                self.progress_update.emit(0)
+                                self.authenticated_user = None
                                 authenticated_user = None
-                                break
+                                try:
+                                    self.table.update_item(
+                                        Key={'task_id': self.task_id},
+                                        UpdateExpression="set #s = :val, progress = :p",
+                                        ExpressionAttributeNames={'#s': 'status'},
+                                        ExpressionAttributeValues={':val': 'challenge_failed', ':p': 0}
+                                    )
+                                except: pass
+                                
+                                # Petite pause pour laisser l'utilisateur voir le message d'erreur
+                                time.sleep(2.0) 
+                                break 
                             else:
                                 challenge_index += 1
                                 self.table.update_item(
